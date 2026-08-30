@@ -31,6 +31,9 @@ if (!TOKEN || !DEFAULT_VOICE_CHANNEL_ID || !CLIENT_ID || !GUILD_ID) {
 let targetVoiceChannelId = DEFAULT_VOICE_CHANNEL_ID;
 let autoRejoinEnabled = true;
 
+// People added with /allow are placed here until the bot restarts.
+const trustedUserIds = new Set();
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -43,17 +46,41 @@ const adminOnly = PermissionFlagsBits.Administrator;
 const commands = [
   new SlashCommandBuilder()
     .setName('status')
-    .setDescription('Check voice connection, target channel, and auto-rejoin status.')
-    .setDefaultMemberPermissions(adminOnly),
-
-  new SlashCommandBuilder()
-    .setName('leave')
-    .setDescription('Leave voice and disable automatic rejoining.')
-    .setDefaultMemberPermissions(adminOnly),
+    .setDescription('Check voice connection and auto-rejoin status.'),
 
   new SlashCommandBuilder()
     .setName('join')
-    .setDescription('Join the configured voice channel and enable rejoining.')
+    .setDescription('Join the configured voice channel and enable rejoining.'),
+
+  new SlashCommandBuilder()
+    .setName('leave')
+    .setDescription('Leave voice and disable automatic rejoining.'),
+
+  new SlashCommandBuilder()
+    .setName('trusted')
+    .setDescription('List users allowed to control voice joining.')
+    .setDefaultMemberPermissions(adminOnly),
+
+  new SlashCommandBuilder()
+    .setName('allow')
+    .setDescription('Allow a user to use join, leave, and status.')
+    .addUserOption((option) =>
+      option
+        .setName('user')
+        .setDescription('User to allow.')
+        .setRequired(true)
+    )
+    .setDefaultMemberPermissions(adminOnly),
+
+  new SlashCommandBuilder()
+    .setName('deny')
+    .setDescription('Remove a user from voice-control access.')
+    .addUserOption((option) =>
+      option
+        .setName('user')
+        .setDescription('User to remove.')
+        .setRequired(true)
+    )
     .setDefaultMemberPermissions(adminOnly),
 
   new SlashCommandBuilder()
@@ -62,7 +89,7 @@ const commands = [
     .addChannelOption((option) =>
       option
         .setName('channel')
-        .setDescription('The voice channel for the bot to join.')
+        .setDescription('New target voice channel.')
         .setRequired(true)
         .addChannelTypes(ChannelType.GuildVoice, ChannelType.GuildStageVoice)
     )
@@ -85,6 +112,16 @@ async function registerCommands() {
   );
 
   console.log('Slash commands registered successfully.');
+}
+
+function isAdministrator(interaction) {
+  return interaction.memberPermissions?.has(
+    PermissionFlagsBits.Administrator
+  );
+}
+
+function canControlVoice(interaction) {
+  return isAdministrator(interaction) || trustedUserIds.has(interaction.user.id);
 }
 
 async function getTargetVoiceChannel() {
@@ -156,12 +193,6 @@ function leaveVoiceChannel() {
   return false;
 }
 
-function isAdministrator(interaction) {
-  return interaction.memberPermissions?.has(
-    PermissionFlagsBits.Administrator
-  );
-}
-
 client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
@@ -198,9 +229,20 @@ client.on('voiceStateUpdate', (oldState, newState) => {
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
-  if (!isAdministrator(interaction)) {
+  const voiceCommands = ['status', 'join', 'leave'];
+  const adminCommands = ['trusted', 'allow', 'deny', 'setchannel', 'shutdown'];
+
+  if (voiceCommands.includes(interaction.commandName) && !canControlVoice(interaction)) {
     await interaction.reply({
-      content: 'You need the Administrator permission to use this bot.',
+      content: 'You do not have permission to control the voice bot.',
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (adminCommands.includes(interaction.commandName) && !isAdministrator(interaction)) {
+    await interaction.reply({
+      content: 'You need the Administrator permission to use this command.',
       ephemeral: true,
     });
     return;
@@ -220,17 +262,29 @@ client.on('interactionCreate', async (interaction) => {
         const target = await getTargetVoiceChannel();
         targetName = target.name;
       } catch {
-        // Keeps /status usable if the target channel was deleted or made inaccessible.
+        // /status can still work if the configured channel was deleted.
       }
 
       await interaction.reply({
         content:
           `Voice status: **${voiceStatus}**\n` +
           `Auto-rejoin: **${autoRejoinEnabled ? 'enabled' : 'disabled'}**\n` +
-          `Target channel: **${targetName}**\n` +
-          `Target ID: \`${targetVoiceChannelId}\``,
+          `Target channel: **${targetName}**`,
         ephemeral: true,
       });
+      return;
+    }
+
+    if (interaction.commandName === 'join') {
+      autoRejoinEnabled = true;
+
+      await interaction.deferReply({ ephemeral: true });
+
+      const message = await joinTargetVoiceChannel();
+
+      await interaction.editReply(
+        `${message}\nAuto-rejoin is now **enabled**.`
+      );
       return;
     }
 
@@ -247,16 +301,62 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    if (interaction.commandName === 'join') {
-      autoRejoinEnabled = true;
+    if (interaction.commandName === 'allow') {
+      const user = interaction.options.getUser('user', true);
 
-      await interaction.deferReply({ ephemeral: true });
+      if (user.bot) {
+        await interaction.reply({
+          content: 'You cannot add another bot as a trusted user.',
+          ephemeral: true,
+        });
+        return;
+      }
 
-      const message = await joinTargetVoiceChannel();
+      trustedUserIds.add(user.id);
 
-      await interaction.editReply(
-        `${message}\nAuto-rejoin is now **enabled**.`
-      );
+      await interaction.reply({
+        content:
+          `${user} can now use **/join**, **/leave**, and **/status**.\n` +
+          'They cannot change the channel, manage trusted users, or shut down the bot.',
+        ephemeral: true,
+      });
+
+      console.log(`Trusted user added: ${user.tag} (${user.id}) by ${interaction.user.tag}.`);
+      return;
+    }
+
+    if (interaction.commandName === 'deny') {
+      const user = interaction.options.getUser('user', true);
+      const wasTrusted = trustedUserIds.delete(user.id);
+
+      await interaction.reply({
+        content: wasTrusted
+          ? `${user} can no longer control the voice bot.`
+          : `${user} was not on the trusted-user list.`,
+        ephemeral: true,
+      });
+
+      console.log(`Trusted user removed: ${user.tag} (${user.id}) by ${interaction.user.tag}.`);
+      return;
+    }
+
+    if (interaction.commandName === 'trusted') {
+      if (trustedUserIds.size === 0) {
+        await interaction.reply({
+          content: 'No trusted users have been added.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const userList = [...trustedUserIds]
+        .map((userId) => `<@${userId}>`)
+        .join('\n');
+
+      await interaction.reply({
+        content: `Trusted users who can use /join, /leave, and /status:\n${userList}`,
+        ephemeral: true,
+      });
       return;
     }
 
@@ -284,8 +384,7 @@ client.on('interactionCreate', async (interaction) => {
 
       await interaction.editReply(
         `Target channel changed to **${selectedChannel.name}**.\n` +
-        `${message}\n` +
-        'Auto-rejoin is now **enabled**.'
+        `${message}\nAuto-rejoin is now **enabled**.`
       );
 
       console.log(
