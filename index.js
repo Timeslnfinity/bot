@@ -52,18 +52,18 @@ async function getTargetVoiceChannel() {
 
 async function joinTargetVoiceChannel() {
   const channel = await getTargetVoiceChannel();
-  const oldConnection = getVoiceConnection(channel.guild.id);
+  const existingConnection = getVoiceConnection(channel.guild.id);
 
   if (
-    oldConnection &&
-    oldConnection.joinConfig.channelId === channel.id &&
-    oldConnection.state.status === VoiceConnectionStatus.Ready
+    existingConnection &&
+    existingConnection.joinConfig.channelId === channel.id &&
+    existingConnection.state.status === VoiceConnectionStatus.Ready
   ) {
     return `Already connected to **${channel.name}**.`;
   }
 
-  if (oldConnection) {
-    oldConnection.destroy();
+  if (existingConnection) {
+    existingConnection.destroy();
   }
 
   const connection = joinVoiceChannel({
@@ -101,7 +101,7 @@ function leaveVoiceChannel() {
   return false;
 }
 
-function hasAdministratorPermission(interaction) {
+function isAdministrator(interaction) {
   return interaction.memberPermissions?.has(
     PermissionFlagsBits.Administrator
   );
@@ -137,7 +137,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
-  if (!hasAdministratorPermission(interaction)) {
+  if (!isAdministrator(interaction)) {
     await interaction.reply({
       content: 'You need the Administrator permission to use this bot.',
       ephemeral: true,
@@ -208,15 +208,15 @@ client.on('interactionCreate', async (interaction) => {
   } catch (error) {
     console.error(`Command error for /${interaction.commandName}:`, error);
 
-    const errorMessage = {
+    const response = {
       content: `Something went wrong: \`${error.message}\``,
       ephemeral: true,
     };
 
     if (interaction.deferred || interaction.replied) {
-      await interaction.editReply(errorMessage);
+      await interaction.editReply(response);
     } else {
-      await interaction.reply(errorMessage);
+      await interaction.reply(response);
     }
   }
 });

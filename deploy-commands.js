@@ -1,6 +1,11 @@
 require('dotenv').config();
 
-const { REST, Routes, SlashCommandBuilder } = require('discord.js');
+const {
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  PermissionFlagsBits,
+} = require('discord.js');
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
@@ -12,29 +17,35 @@ if (!TOKEN || !CLIENT_ID || !GUILD_ID) {
   );
 }
 
+const adminOnly = PermissionFlagsBits.Administrator;
+
 const commands = [
   new SlashCommandBuilder()
     .setName('status')
-    .setDescription('Check the bot voice connection and auto-rejoin status.'),
+    .setDescription('Check voice connection and auto-rejoin status.')
+    .setDefaultMemberPermissions(adminOnly),
 
   new SlashCommandBuilder()
     .setName('leave')
-    .setDescription('Leave voice and disable automatic rejoining.'),
+    .setDescription('Leave voice and disable automatic rejoining.')
+    .setDefaultMemberPermissions(adminOnly),
 
   new SlashCommandBuilder()
     .setName('join')
-    .setDescription('Join the configured voice channel and enable auto-rejoining.'),
+    .setDescription('Join the configured voice channel and enable rejoining.')
+    .setDefaultMemberPermissions(adminOnly),
 
   new SlashCommandBuilder()
     .setName('shutdown')
-    .setDescription('Leave voice and turn off the bot process.'),
+    .setDescription('Leave voice and stop the bot process.')
+    .setDefaultMemberPermissions(adminOnly),
 ].map((command) => command.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(TOKEN);
 
 (async () => {
   try {
-    console.log(`Registering ${commands.length} slash commands...`);
+    console.log(`Registering ${commands.length} server slash commands...`);
 
     await rest.put(
       Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
@@ -43,7 +54,7 @@ const rest = new REST({ version: '10' }).setToken(TOKEN);
 
     console.log('Slash commands registered successfully.');
   } catch (error) {
-    console.error('Could not register slash commands:', error);
+    console.error('Failed to register slash commands:', error);
     process.exit(1);
   }
 })();
