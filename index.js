@@ -5,6 +5,9 @@ const {
   GatewayIntentBits,
   ChannelType,
   PermissionFlagsBits,
+  REST,
+  Routes,
+  SlashCommandBuilder,
 } = require('discord.js');
 
 const {
@@ -16,10 +19,12 @@ const {
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID;
+const CLIENT_ID = process.env.CLIENT_ID;
+const GUILD_ID = process.env.GUILD_ID;
 
-if (!TOKEN || !VOICE_CHANNEL_ID) {
+if (!TOKEN || !VOICE_CHANNEL_ID || !CLIENT_ID || !GUILD_ID) {
   throw new Error(
-    'Missing DISCORD_TOKEN or VOICE_CHANNEL_ID in the environment variables.'
+    'Missing DISCORD_TOKEN, VOICE_CHANNEL_ID, CLIENT_ID, or GUILD_ID in environment variables.'
   );
 }
 
@@ -31,6 +36,43 @@ const client = new Client({
     GatewayIntentBits.GuildVoiceStates,
   ],
 });
+
+const adminOnly = PermissionFlagsBits.Administrator;
+
+const commands = [
+  new SlashCommandBuilder()
+    .setName('status')
+    .setDescription('Check voice connection and auto-rejoin status.')
+    .setDefaultMemberPermissions(adminOnly),
+
+  new SlashCommandBuilder()
+    .setName('leave')
+    .setDescription('Leave voice and disable automatic rejoining.')
+    .setDefaultMemberPermissions(adminOnly),
+
+  new SlashCommandBuilder()
+    .setName('join')
+    .setDescription('Join the configured voice channel and enable rejoining.')
+    .setDefaultMemberPermissions(adminOnly),
+
+  new SlashCommandBuilder()
+    .setName('shutdown')
+    .setDescription('Leave voice and stop the bot process.')
+    .setDefaultMemberPermissions(adminOnly),
+].map((command) => command.toJSON());
+
+async function registerCommands() {
+  const rest = new REST({ version: '10' }).setToken(TOKEN);
+
+  console.log(`Registering ${commands.length} slash commands...`);
+
+  await rest.put(
+    Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
+    { body: commands }
+  );
+
+  console.log('Slash commands registered successfully.');
+}
 
 async function getTargetVoiceChannel() {
   const channel = await client.channels.fetch(VOICE_CHANNEL_ID);
@@ -109,6 +151,12 @@ function isAdministrator(interaction) {
 
 client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`);
+
+  try {
+    await registerCommands();
+  } catch (error) {
+    console.error('Command registration error:', error);
+  }
 
   try {
     const message = await joinTargetVoiceChannel();
