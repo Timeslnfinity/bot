@@ -1,5 +1,8 @@
 require('dotenv').config();
 
+const fs = require('node:fs');
+const path = require('node:path');
+
 const {
   Client,
   GatewayIntentBits,
@@ -28,11 +31,60 @@ if (!TOKEN || !DEFAULT_VOICE_CHANNEL_ID || !CLIENT_ID || !GUILD_ID) {
   );
 }
 
+const DATA_DIR = path.join(__dirname, 'data');
+const TRUSTED_USERS_FILE = path.join(DATA_DIR, 'trusted-users.json');
+const PARTICIPANTS_FILE = path.join(DATA_DIR, 'activity-participants.json');
+const ACTIVITY_CONFIG_FILE = path.join(DATA_DIR, 'activity-config.json');
+
+function ensureDataFiles() {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+
+  if (!fs.existsSync(TRUSTED_USERS_FILE)) {
+    fs.writeFileSync(TRUSTED_USERS_FILE, '[]\n');
+  }
+
+  if (!fs.existsSync(PARTICIPANTS_FILE)) {
+    fs.writeFileSync(PARTICIPANTS_FILE, '[]\n');
+  }
+
+  if (!fs.existsSync(ACTIVITY_CONFIG_FILE)) {
+    fs.writeFileSync(
+      ACTIVITY_CONFIG_FILE,
+      JSON.stringify({ channelIds: [] }, null, 2) + '\n'
+    );
+  }
+}
+
+function readJson(file, fallback) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (error) {
+    console.error(`Could not read ${path.basename(file)}:`, error);
+    return fallback;
+  }
+}
+
+function writeJson(file, value) {
+  fs.writeFileSync(file, JSON.stringify(value, null, 2) + '\n');
+}
+
+ensureDataFiles();
+
+let trustedUserIds = new Set(readJson(TRUSTED_USERS_FILE, []));
+let activityParticipantIds = new Set(readJson(PARTICIPANTS_FILE, []));
+let activityConfig = readJson(ACTIVITY_CONFIG_FILE, { channelIds: [] });
+
+if (!Array.isArray(activityConfig.channelIds)) {
+  activityConfig.channelIds = [];
+}
+
 let targetVoiceChannelId = DEFAULT_VOICE_CHANNEL_ID;
 let autoRejoinEnabled = true;
 
-// People added with /allow are placed here until the bot restarts.
-const trustedUserIds = new Set();
+let activityRunning = false;
+let activityStartedBy = null;
+let activityEndsAt = null;
+let activityStopTimer = null;
 
 const client = new Client({
   intents: [
@@ -46,7 +98,7 @@ const adminOnly = PermissionFlagsBits.Administrator;
 const commands = [
   new SlashCommandBuilder()
     .setName('status')
-    .setDescription('Check voice connection and auto-rejoin status.'),
+    .setDescription('Check normal voice connection and auto-rejoin status.'),
 
   new SlashCommandBuilder()
     .setName('join')
@@ -58,7 +110,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('trusted')
-    .setDescription('List users allowed to control voice joining.')
+    .setDescription('List users allowed to control normal voice joining.')
     .setDefaultMemberPermissions(adminOnly),
 
   new SlashCommandBuilder()
@@ -74,7 +126,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('deny')
-    .setDescription('Remove a user from voice-control access.')
+    .setDescription('Remove a user from normal voice-control access.')
     .addUserOption((option) =>
       option
         .setName('user')
@@ -98,6 +150,76 @@ const commands = [
   new SlashCommandBuilder()
     .setName('shutdown')
     .setDescription('Leave voice and stop the bot process.')
+    .setDefaultMemberPermissions(adminOnly),
+
+  new SlashCommandBuilder()
+    .setName('optin')
+    .setDescription('Opt yourself in to the activity participant list.'),
+
+  new SlashCommandBuilder()
+    .setName('optout')
+    .setDescription('Remove yourself from the activity participant list.'),
+
+  new SlashCommandBuilder()
+    .setName('participants')
+    .setDescription('List users opted in to the activity.')
+    .setDefaultMemberPermissions(adminOnly),
+
+  new SlashCommandBuilder()
+    .setName('activity-channel-add')
+    .setDescription('Add a voice channel to the activity channel list.')
+    .addChannelOption((option) =>
+      option
+        .setName('channel')
+        .setDescription('Voice channel to add.')
+        .setRequired(true)
+        .addChannelTypes(ChannelType.GuildVoice, ChannelType.GuildStageVoice)
+    )
+    .setDefaultMemberPermissions(adminOnly),
+
+  new SlashCommandBuilder()
+    .setName('activity-channel-remove')
+    .setDescription('Remove a voice channel from the activity list.')
+    .addChannelOption((option) =>
+      option
+        .setName('channel')
+        .setDescription('Voice channel to remove.')
+        .setRequired(true)
+        .addChannelTypes(ChannelType.GuildVoice, ChannelType.GuildStageVoice)
+    )
+    .setDefaultMemberPermissions(adminOnly),
+
+  new SlashCommandBuilder()
+    .setName('activity-channels')
+    .setDescription('List all saved activity voice channels.')
+    .setDefaultMemberPermissions(adminOnly),
+
+  new SlashCommandBuilder()
+    .setName('activity-channel-clear')
+    .setDescription('Remove every channel from the activity channel list.')
+    .setDefaultMemberPermissions(adminOnly),
+
+  new SlashCommandBuilder()
+    .setName('activity-start')
+    .setDescription('Start a timed opt-in activity session.')
+    .addIntegerOption((option) =>
+      option
+        .setName('duration')
+        .setDescription('Duration in seconds, from 5 to 300.')
+        .setRequired(true)
+        .setMinValue(5)
+        .setMaxValue(300)
+    )
+    .setDefaultMemberPermissions(adminOnly),
+
+  new SlashCommandBuilder()
+    .setName('activity-stop')
+    .setDescription('Stop the active opt-in activity session.')
+    .setDefaultMemberPermissions(adminOnly),
+
+  new SlashCommandBuilder()
+    .setName('activity-status')
+    .setDescription('Show opt-in activity status and channel count.')
     .setDefaultMemberPermissions(adminOnly),
 ].map((command) => command.toJSON());
 
@@ -124,22 +246,68 @@ function canControlVoice(interaction) {
   return isAdministrator(interaction) || trustedUserIds.has(interaction.user.id);
 }
 
+function saveTrustedUsers() {
+  writeJson(TRUSTED_USERS_FILE, [...trustedUserIds]);
+}
+
+function saveParticipants() {
+  writeJson(PARTICIPANTS_FILE, [...activityParticipantIds]);
+}
+
+function saveActivityConfig() {
+  writeJson(ACTIVITY_CONFIG_FILE, activityConfig);
+}
+
+function isVoiceChannel(channel) {
+  return (
+    channel &&
+    (channel.type === ChannelType.GuildVoice ||
+      channel.type === ChannelType.GuildStageVoice)
+  );
+}
+
 async function getTargetVoiceChannel() {
   const channel = await client.channels.fetch(targetVoiceChannelId);
 
-  if (!channel) {
-    throw new Error('Target voice channel was not found.');
-  }
-
-  const isVoiceChannel =
-    channel.type === ChannelType.GuildVoice ||
-    channel.type === ChannelType.GuildStageVoice;
-
-  if (!isVoiceChannel) {
+  if (!isVoiceChannel(channel)) {
     throw new Error('The target channel is not a voice or stage channel.');
   }
 
   return channel;
+}
+
+async function getActivityChannels() {
+  if (activityConfig.channelIds.length === 0) {
+    throw new Error(
+      'No activity channels are configured. Use /activity-channel-add first.'
+    );
+  }
+
+  const channels = [];
+
+  for (const channelId of activityConfig.channelIds) {
+    try {
+      const channel = await client.channels.fetch(channelId);
+
+      if (isVoiceChannel(channel)) {
+        channels.push(channel);
+      } else {
+        console.warn(`Ignoring invalid activity channel ID: ${channelId}`);
+      }
+    } catch (error) {
+      console.warn(
+        `Could not fetch activity channel ${channelId}: ${error.message}`
+      );
+    }
+  }
+
+  if (channels.length === 0) {
+    throw new Error(
+      'No saved activity channels are accessible. Check the list and bot permissions.'
+    );
+  }
+
+  return channels;
 }
 
 async function joinTargetVoiceChannel() {
@@ -193,6 +361,19 @@ function leaveVoiceChannel() {
   return false;
 }
 
+function stopActivity(reason = 'Stopped.') {
+  activityRunning = false;
+  activityStartedBy = null;
+  activityEndsAt = null;
+
+  if (activityStopTimer) {
+    clearTimeout(activityStopTimer);
+    activityStopTimer = null;
+  }
+
+  console.log(`Activity stopped: ${reason}`);
+}
+
 client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
@@ -229,18 +410,39 @@ client.on('voiceStateUpdate', (oldState, newState) => {
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
-  const voiceCommands = ['status', 'join', 'leave'];
-  const adminCommands = ['trusted', 'allow', 'deny', 'setchannel', 'shutdown'];
+  const normalVoiceCommands = ['status', 'join', 'leave'];
 
-  if (voiceCommands.includes(interaction.commandName) && !canControlVoice(interaction)) {
+  const adminCommands = [
+    'trusted',
+    'allow',
+    'deny',
+    'setchannel',
+    'shutdown',
+    'participants',
+    'activity-channel-add',
+    'activity-channel-remove',
+    'activity-channels',
+    'activity-channel-clear',
+    'activity-start',
+    'activity-stop',
+    'activity-status',
+  ];
+
+  if (
+    normalVoiceCommands.includes(interaction.commandName) &&
+    !canControlVoice(interaction)
+  ) {
     await interaction.reply({
-      content: 'You do not have permission to control the voice bot.',
+      content: 'You do not have permission to control the normal voice bot.',
       ephemeral: true,
     });
     return;
   }
 
-  if (adminCommands.includes(interaction.commandName) && !isAdministrator(interaction)) {
+  if (
+    adminCommands.includes(interaction.commandName) &&
+    !isAdministrator(interaction)
+  ) {
     await interaction.reply({
       content: 'You need the Administrator permission to use this command.',
       ephemeral: true,
@@ -262,7 +464,7 @@ client.on('interactionCreate', async (interaction) => {
         const target = await getTargetVoiceChannel();
         targetName = target.name;
       } catch {
-        // /status can still work if the configured channel was deleted.
+        // Keep status usable even if the channel was deleted.
       }
 
       await interaction.reply({
@@ -277,7 +479,6 @@ client.on('interactionCreate', async (interaction) => {
 
     if (interaction.commandName === 'join') {
       autoRejoinEnabled = true;
-
       await interaction.deferReply({ ephemeral: true });
 
       const message = await joinTargetVoiceChannel();
@@ -313,69 +514,49 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       trustedUserIds.add(user.id);
+      saveTrustedUsers();
 
       await interaction.reply({
-        content:
-          `${user} can now use **/join**, **/leave**, and **/status**.\n` +
-          'They cannot change the channel, manage trusted users, or shut down the bot.',
+        content: `${user} can now use **/join**, **/leave**, and **/status**.`,
         ephemeral: true,
       });
-
-      console.log(`Trusted user added: ${user.tag} (${user.id}) by ${interaction.user.tag}.`);
       return;
     }
 
     if (interaction.commandName === 'deny') {
       const user = interaction.options.getUser('user', true);
-      const wasTrusted = trustedUserIds.delete(user.id);
+      const removed = trustedUserIds.delete(user.id);
+
+      if (removed) {
+        saveTrustedUsers();
+      }
 
       await interaction.reply({
-        content: wasTrusted
-          ? `${user} can no longer control the voice bot.`
+        content: removed
+          ? `${user} can no longer control the normal voice bot.`
           : `${user} was not on the trusted-user list.`,
         ephemeral: true,
       });
-
-      console.log(`Trusted user removed: ${user.tag} (${user.id}) by ${interaction.user.tag}.`);
       return;
     }
 
     if (interaction.commandName === 'trusted') {
-      if (trustedUserIds.size === 0) {
-        await interaction.reply({
-          content: 'No trusted users have been added.',
-          ephemeral: true,
-        });
-        return;
-      }
-
-      const userList = [...trustedUserIds]
-        .map((userId) => `<@${userId}>`)
-        .join('\n');
+      const users = [...trustedUserIds];
 
       await interaction.reply({
-        content: `Trusted users who can use /join, /leave, and /status:\n${userList}`,
+        content:
+          users.length > 0
+            ? `Trusted users:\n${users.map((id) => `<@${id}>`).join('\n')}`
+            : 'No trusted users have been added.',
         ephemeral: true,
       });
       return;
     }
 
     if (interaction.commandName === 'setchannel') {
-      const selectedChannel = interaction.options.getChannel('channel', true);
+      const channel = interaction.options.getChannel('channel', true);
 
-      const isVoiceChannel =
-        selectedChannel.type === ChannelType.GuildVoice ||
-        selectedChannel.type === ChannelType.GuildStageVoice;
-
-      if (!isVoiceChannel) {
-        await interaction.reply({
-          content: 'Please select a normal voice channel or stage channel.',
-          ephemeral: true,
-        });
-        return;
-      }
-
-      targetVoiceChannelId = selectedChannel.id;
+      targetVoiceChannelId = channel.id;
       autoRejoinEnabled = true;
 
       await interaction.deferReply({ ephemeral: true });
@@ -383,18 +564,212 @@ client.on('interactionCreate', async (interaction) => {
       const message = await joinTargetVoiceChannel();
 
       await interaction.editReply(
-        `Target channel changed to **${selectedChannel.name}**.\n` +
-        `${message}\nAuto-rejoin is now **enabled**.`
+        `Target channel changed to **${channel.name}**.\n${message}`
+      );
+      return;
+    }
+
+    if (interaction.commandName === 'optin') {
+      activityParticipantIds.add(interaction.user.id);
+      saveParticipants();
+
+      await interaction.reply({
+        content: 'You are now opted in to the activity participant list.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.commandName === 'optout') {
+      const removed = activityParticipantIds.delete(interaction.user.id);
+
+      if (removed) {
+        saveParticipants();
+      }
+
+      await interaction.reply({
+        content: removed
+          ? 'You are no longer opted in to the activity participant list.'
+          : 'You were not opted in.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.commandName === 'participants') {
+      const users = [...activityParticipantIds];
+
+      await interaction.reply({
+        content:
+          users.length > 0
+            ? `Opted-in participants:\n${users.map((id) => `<@${id}>`).join('\n')}`
+            : 'No users are currently opted in.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.commandName === 'activity-channel-add') {
+      const channel = interaction.options.getChannel('channel', true);
+
+      if (activityConfig.channelIds.includes(channel.id)) {
+        await interaction.reply({
+          content: `**${channel.name}** is already in the activity channel list.`,
+          ephemeral: true,
+        });
+        return;
+      }
+
+      activityConfig.channelIds.push(channel.id);
+      saveActivityConfig();
+
+      await interaction.reply({
+        content:
+          `Added **${channel.name}**.\n` +
+          `Saved activity channels: **${activityConfig.channelIds.length}**`,
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.commandName === 'activity-channel-remove') {
+      const channel = interaction.options.getChannel('channel', true);
+      const oldLength = activityConfig.channelIds.length;
+
+      activityConfig.channelIds = activityConfig.channelIds.filter(
+        (channelId) => channelId !== channel.id
       );
 
-      console.log(
-        `Target channel changed to ${selectedChannel.name} (${selectedChannel.id}) by ${interaction.user.tag}.`
-      );
+      if (activityConfig.channelIds.length === oldLength) {
+        await interaction.reply({
+          content: `**${channel.name}** was not in the activity channel list.`,
+          ephemeral: true,
+        });
+        return;
+      }
+
+      saveActivityConfig();
+
+      await interaction.reply({
+        content:
+          `Removed **${channel.name}**.\n` +
+          `Saved activity channels: **${activityConfig.channelIds.length}**`,
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.commandName === 'activity-channels') {
+      if (activityConfig.channelIds.length === 0) {
+        await interaction.reply({
+          content: 'No activity channels have been saved.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const channelList = activityConfig.channelIds
+        .map((channelId, index) => `${index + 1}. <#${channelId}>`)
+        .join('\n');
+
+      await interaction.reply({
+        content:
+          `Saved activity channels (**${activityConfig.channelIds.length}**):\n` +
+          channelList,
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.commandName === 'activity-channel-clear') {
+      activityConfig.channelIds = [];
+      saveActivityConfig();
+
+      await interaction.reply({
+        content: 'Removed all saved activity channels.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.commandName === 'activity-start') {
+      if (activityRunning) {
+        await interaction.reply({
+          content: 'The activity is already running.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const durationSeconds = interaction.options.getInteger('duration', true);
+      const channels = await getActivityChannels();
+
+      activityRunning = true;
+      activityStartedBy = interaction.user.id;
+      activityEndsAt = Date.now() + durationSeconds * 1000;
+
+      activityStopTimer = setTimeout(() => {
+        stopActivity('Duration completed.');
+      }, durationSeconds * 1000);
+
+      await interaction.reply({
+        content:
+          `Activity started for **${durationSeconds} seconds**.\n` +
+          `Opted-in participants: **${activityParticipantIds.size}**\n` +
+          `Valid configured channels: **${channels.length}**.`,
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.commandName === 'activity-stop') {
+      if (!activityRunning) {
+        await interaction.reply({
+          content: 'The activity is not running.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      stopActivity(`Stopped by ${interaction.user.tag}.`);
+
+      await interaction.reply({
+        content: 'Activity stopped.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.commandName === 'activity-status') {
+      const secondsRemaining = activityRunning
+        ? Math.max(0, Math.ceil((activityEndsAt - Date.now()) / 1000))
+        : 0;
+
+      let validChannelCount = 0;
+
+      if (activityConfig.channelIds.length > 0) {
+        try {
+          validChannelCount = (await getActivityChannels()).length;
+        } catch {
+          validChannelCount = 0;
+        }
+      }
+
+      await interaction.reply({
+        content:
+          `Activity running: **${activityRunning ? 'yes' : 'no'}**\n` +
+          `Time remaining: **${secondsRemaining} seconds**\n` +
+          `Opted-in participants: **${activityParticipantIds.size}**\n` +
+          `Saved channel IDs: **${activityConfig.channelIds.length}**\n` +
+          `Accessible voice channels: **${validChannelCount}**`,
+        ephemeral: true,
+      });
       return;
     }
 
     if (interaction.commandName === 'shutdown') {
       autoRejoinEnabled = false;
+      stopActivity('Bot shutdown.');
       leaveVoiceChannel();
 
       await interaction.reply({
@@ -402,8 +777,6 @@ client.on('interactionCreate', async (interaction) => {
           'Shutting down. I left voice and will not rejoin unless the host starts me again.',
         ephemeral: true,
       });
-
-      console.log(`Shutdown requested by ${interaction.user.tag}.`);
 
       setTimeout(() => {
         client.destroy();
