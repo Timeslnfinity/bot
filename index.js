@@ -1,6 +1,12 @@
 require('dotenv').config();
 
-const { Client, GatewayIntentBits, ChannelType } = require('discord.js');
+const {
+  Client,
+  GatewayIntentBits,
+  ChannelType,
+  PermissionFlagsBits,
+} = require('discord.js');
+
 const {
   joinVoiceChannel,
   getVoiceConnection,
@@ -13,9 +19,11 @@ const VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID;
 
 if (!TOKEN || !VOICE_CHANNEL_ID) {
   throw new Error(
-    'Missing DISCORD_TOKEN or VOICE_CHANNEL_ID. Add them to your host environment variables.'
+    'Missing DISCORD_TOKEN or VOICE_CHANNEL_ID in the environment variables.'
   );
 }
+
+let autoRejoinEnabled = true;
 
 const client = new Client({
   intents: [
@@ -24,21 +32,26 @@ const client = new Client({
   ],
 });
 
-async function joinTargetVoiceChannel() {
+async function getTargetVoiceChannel() {
   const channel = await client.channels.fetch(VOICE_CHANNEL_ID);
 
   if (!channel) {
     throw new Error('Voice channel not found. Check VOICE_CHANNEL_ID.');
   }
 
-  const validVoiceChannel =
+  const isVoiceChannel =
     channel.type === ChannelType.GuildVoice ||
     channel.type === ChannelType.GuildStageVoice;
 
-  if (!validVoiceChannel) {
-    throw new Error('VOICE_CHANNEL_ID must be a normal voice or stage channel.');
+  if (!isVoiceChannel) {
+    throw new Error('VOICE_CHANNEL_ID must be a voice or stage channel.');
   }
 
+  return channel;
+}
+
+async function joinTargetVoiceChannel() {
+  const channel = await getTargetVoiceChannel();
   const oldConnection = getVoiceConnection(channel.guild.id);
 
   if (
@@ -46,8 +59,7 @@ async function joinTargetVoiceChannel() {
     oldConnection.joinConfig.channelId === channel.id &&
     oldConnection.state.status === VoiceConnectionStatus.Ready
   ) {
-    console.log(`Already connected to: ${channel.name}`);
-    return;
+    return `Already connected to **${channel.name}**.`;
   }
 
   if (oldConnection) {
@@ -69,17 +81,38 @@ async function joinTargetVoiceChannel() {
   try {
     await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
     console.log(`Connected to: ${channel.name}`);
+    return `Connected to **${channel.name}**.`;
   } catch (error) {
     connection.destroy();
-    console.error('Could not connect to the VC:', error);
+    throw error;
   }
 }
 
-client.once('ready', async () => {
+function leaveVoiceChannel() {
+  for (const [, guild] of client.guilds.cache) {
+    const connection = getVoiceConnection(guild.id);
+
+    if (connection) {
+      connection.destroy();
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function hasAdministratorPermission(interaction) {
+  return interaction.memberPermissions?.has(
+    PermissionFlagsBits.Administrator
+  );
+}
+
+client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
   try {
-    await joinTargetVoiceChannel();
+    const message = await joinTargetVoiceChannel();
+    console.log(message);
   } catch (error) {
     console.error('Startup voice error:', error);
   }
@@ -87,15 +120,104 @@ client.once('ready', async () => {
 
 client.on('voiceStateUpdate', (oldState, newState) => {
   if (oldState.member?.id !== client.user.id) return;
+  if (!autoRejoinEnabled) return;
+  if (oldState.channelId === newState.channelId) return;
 
-  if (oldState.channelId !== newState.channelId) {
-    console.log('Bot was moved/disconnected. Rejoining in 5 seconds...');
+  console.log('Bot was moved or disconnected. Rejoining in 5 seconds...');
 
-    setTimeout(() => {
-      joinTargetVoiceChannel().catch((error) => {
-        console.error('Rejoin error:', error);
+  setTimeout(() => {
+    if (!autoRejoinEnabled) return;
+
+    joinTargetVoiceChannel().catch((error) => {
+      console.error('Rejoin error:', error);
+    });
+  }, 5_000);
+});
+
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+
+  if (!hasAdministratorPermission(interaction)) {
+    await interaction.reply({
+      content: 'You need the Administrator permission to use this bot.',
+      ephemeral: true,
+    });
+    return;
+  }
+
+  try {
+    if (interaction.commandName === 'status') {
+      const connection = [...client.guilds.cache.values()]
+        .map((guild) => getVoiceConnection(guild.id))
+        .find(Boolean);
+
+      const voiceStatus = connection?.state.status ?? 'disconnected';
+
+      await interaction.reply({
+        content:
+          `Voice status: **${voiceStatus}**\n` +
+          `Auto-rejoin: **${autoRejoinEnabled ? 'enabled' : 'disabled'}**`,
+        ephemeral: true,
       });
-    }, 5_000);
+      return;
+    }
+
+    if (interaction.commandName === 'leave') {
+      autoRejoinEnabled = false;
+      const left = leaveVoiceChannel();
+
+      await interaction.reply({
+        content: left
+          ? 'Left voice. Auto-rejoin is now **disabled**.'
+          : 'Auto-rejoin is now **disabled**. I was not in voice.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.commandName === 'join') {
+      autoRejoinEnabled = true;
+
+      await interaction.deferReply({ ephemeral: true });
+
+      const message = await joinTargetVoiceChannel();
+
+      await interaction.editReply(
+        `${message}\nAuto-rejoin is now **enabled**.`
+      );
+      return;
+    }
+
+    if (interaction.commandName === 'shutdown') {
+      autoRejoinEnabled = false;
+      leaveVoiceChannel();
+
+      await interaction.reply({
+        content:
+          'Shutting down. I left voice and will not rejoin unless the host starts me again.',
+        ephemeral: true,
+      });
+
+      console.log(`Shutdown requested by ${interaction.user.tag}.`);
+
+      setTimeout(() => {
+        client.destroy();
+        process.exit(0);
+      }, 1_000);
+    }
+  } catch (error) {
+    console.error(`Command error for /${interaction.commandName}:`, error);
+
+    const errorMessage = {
+      content: `Something went wrong: \`${error.message}\``,
+      ephemeral: true,
+    };
+
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply(errorMessage);
+    } else {
+      await interaction.reply(errorMessage);
+    }
   }
 });
 
