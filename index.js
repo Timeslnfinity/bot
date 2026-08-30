@@ -88,7 +88,7 @@ let activityStopTimer = null;
 let activityMoveTimer = null;
 let activityMoveInProgress = false;
 
-const ACTIVITY_MOVE_INTERVAL_MS = 2_000;
+const ACTIVITY_MOVE_INTERVAL_MS = 500;
 
 const client = new Client({
   intents: [
