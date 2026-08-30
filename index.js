@@ -85,6 +85,10 @@ let activityRunning = false;
 let activityStartedBy = null;
 let activityEndsAt = null;
 let activityStopTimer = null;
+let activityMoveTimer = null;
+let activityMoveInProgress = false;
+
+const ACTIVITY_MOVE_INTERVAL_MS = 2_000;
 
 const client = new Client({
   intents: [
@@ -310,6 +314,62 @@ async function getActivityChannels() {
   return channels;
 }
 
+async function moveActivityParticipants(channels) {
+  if (!activityRunning || activityMoveInProgress || channels.length < 2) {
+    return;
+  }
+
+  activityMoveInProgress = true;
+
+  try {
+    const guild = channels[0].guild;
+
+    await Promise.all(
+      [...activityParticipantIds].map(async (participantId) => {
+        try {
+          const member = await guild.members.fetch(participantId);
+
+          if (member.user.bot || !member.voice.channelId) return;
+
+          const destinationChannels = channels.filter(
+            (channel) => channel.id !== member.voice.channelId
+          );
+
+          if (destinationChannels.length === 0) return;
+
+          const destination =
+            destinationChannels[
+              Math.floor(Math.random() * destinationChannels.length)
+            ];
+
+          await member.voice.setChannel(destination);
+          console.log(
+            `Moved ${member.user.tag} to activity channel ${destination.name}.`
+          );
+        } catch (error) {
+          console.warn(
+            `Could not move activity participant ${participantId}: ${error.message}`
+          );
+        }
+      })
+    );
+  } finally {
+    activityMoveInProgress = false;
+  }
+}
+
+async function startActivityMovement(channels) {
+  await moveActivityParticipants(channels);
+
+  if (!activityRunning) return;
+
+  activityMoveTimer = setInterval(() => {
+    moveActivityParticipants(channels).catch((error) => {
+      console.error('Activity movement error:', error);
+    });
+  }, ACTIVITY_MOVE_INTERVAL_MS);
+}
+
 async function joinTargetVoiceChannel() {
   const channel = await getTargetVoiceChannel();
   const existingConnection = getVoiceConnection(channel.guild.id);
@@ -370,6 +430,13 @@ function stopActivity(reason = 'Stopped.') {
     clearTimeout(activityStopTimer);
     activityStopTimer = null;
   }
+
+  if (activityMoveTimer) {
+    clearInterval(activityMoveTimer);
+    activityMoveTimer = null;
+  }
+
+  activityMoveInProgress = false;
 
   console.log(`Activity stopped: ${reason}`);
 }
@@ -704,6 +771,14 @@ client.on('interactionCreate', async (interaction) => {
       const durationSeconds = interaction.options.getInteger('duration', true);
       const channels = await getActivityChannels();
 
+      if (channels.length < 2) {
+        await interaction.reply({
+          content: 'Configure at least two accessible activity channels before starting the activity.',
+          ephemeral: true,
+        });
+        return;
+      }
+
       activityRunning = true;
       activityStartedBy = interaction.user.id;
       activityEndsAt = Date.now() + durationSeconds * 1000;
@@ -712,11 +787,17 @@ client.on('interactionCreate', async (interaction) => {
         stopActivity('Duration completed.');
       }, durationSeconds * 1000);
 
+      startActivityMovement(channels).catch((error) => {
+        console.error('Could not start activity movement:', error);
+        stopActivity('Movement failed to start.');
+      });
+
       await interaction.reply({
         content:
           `Activity started for **${durationSeconds} seconds**.\n` +
           `Opted-in participants: **${activityParticipantIds.size}**\n` +
-          `Valid configured channels: **${channels.length}**.`,
+          `Valid configured channels: **${channels.length}**.\n` +
+          `Participants in voice will move every **${ACTIVITY_MOVE_INTERVAL_MS / 1000} seconds**.`,
         ephemeral: true,
       });
       return;
