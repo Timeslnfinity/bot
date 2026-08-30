@@ -18,16 +18,17 @@ const {
 } = require('@discordjs/voice');
 
 const TOKEN = process.env.DISCORD_TOKEN;
-const VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID;
+const DEFAULT_VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID;
 
-if (!TOKEN || !VOICE_CHANNEL_ID || !CLIENT_ID || !GUILD_ID) {
+if (!TOKEN || !DEFAULT_VOICE_CHANNEL_ID || !CLIENT_ID || !GUILD_ID) {
   throw new Error(
     'Missing DISCORD_TOKEN, VOICE_CHANNEL_ID, CLIENT_ID, or GUILD_ID in environment variables.'
   );
 }
 
+let targetVoiceChannelId = DEFAULT_VOICE_CHANNEL_ID;
 let autoRejoinEnabled = true;
 
 const client = new Client({
@@ -42,7 +43,7 @@ const adminOnly = PermissionFlagsBits.Administrator;
 const commands = [
   new SlashCommandBuilder()
     .setName('status')
-    .setDescription('Check voice connection and auto-rejoin status.')
+    .setDescription('Check voice connection, target channel, and auto-rejoin status.')
     .setDefaultMemberPermissions(adminOnly),
 
   new SlashCommandBuilder()
@@ -53,6 +54,18 @@ const commands = [
   new SlashCommandBuilder()
     .setName('join')
     .setDescription('Join the configured voice channel and enable rejoining.')
+    .setDefaultMemberPermissions(adminOnly),
+
+  new SlashCommandBuilder()
+    .setName('setchannel')
+    .setDescription('Set the voice channel the bot should join.')
+    .addChannelOption((option) =>
+      option
+        .setName('channel')
+        .setDescription('The voice channel for the bot to join.')
+        .setRequired(true)
+        .addChannelTypes(ChannelType.GuildVoice, ChannelType.GuildStageVoice)
+    )
     .setDefaultMemberPermissions(adminOnly),
 
   new SlashCommandBuilder()
@@ -75,10 +88,10 @@ async function registerCommands() {
 }
 
 async function getTargetVoiceChannel() {
-  const channel = await client.channels.fetch(VOICE_CHANNEL_ID);
+  const channel = await client.channels.fetch(targetVoiceChannelId);
 
   if (!channel) {
-    throw new Error('Voice channel not found. Check VOICE_CHANNEL_ID.');
+    throw new Error('Target voice channel was not found.');
   }
 
   const isVoiceChannel =
@@ -86,7 +99,7 @@ async function getTargetVoiceChannel() {
     channel.type === ChannelType.GuildStageVoice;
 
   if (!isVoiceChannel) {
-    throw new Error('VOICE_CHANNEL_ID must be a voice or stage channel.');
+    throw new Error('The target channel is not a voice or stage channel.');
   }
 
   return channel;
@@ -201,10 +214,21 @@ client.on('interactionCreate', async (interaction) => {
 
       const voiceStatus = connection?.state.status ?? 'disconnected';
 
+      let targetName = 'Unknown channel';
+
+      try {
+        const target = await getTargetVoiceChannel();
+        targetName = target.name;
+      } catch {
+        // Keeps /status usable if the target channel was deleted or made inaccessible.
+      }
+
       await interaction.reply({
         content:
           `Voice status: **${voiceStatus}**\n` +
-          `Auto-rejoin: **${autoRejoinEnabled ? 'enabled' : 'disabled'}**`,
+          `Auto-rejoin: **${autoRejoinEnabled ? 'enabled' : 'disabled'}**\n` +
+          `Target channel: **${targetName}**\n` +
+          `Target ID: \`${targetVoiceChannelId}\``,
         ephemeral: true,
       });
       return;
@@ -232,6 +256,40 @@ client.on('interactionCreate', async (interaction) => {
 
       await interaction.editReply(
         `${message}\nAuto-rejoin is now **enabled**.`
+      );
+      return;
+    }
+
+    if (interaction.commandName === 'setchannel') {
+      const selectedChannel = interaction.options.getChannel('channel', true);
+
+      const isVoiceChannel =
+        selectedChannel.type === ChannelType.GuildVoice ||
+        selectedChannel.type === ChannelType.GuildStageVoice;
+
+      if (!isVoiceChannel) {
+        await interaction.reply({
+          content: 'Please select a normal voice channel or stage channel.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      targetVoiceChannelId = selectedChannel.id;
+      autoRejoinEnabled = true;
+
+      await interaction.deferReply({ ephemeral: true });
+
+      const message = await joinTargetVoiceChannel();
+
+      await interaction.editReply(
+        `Target channel changed to **${selectedChannel.name}**.\n` +
+        `${message}\n` +
+        'Auto-rejoin is now **enabled**.'
+      );
+
+      console.log(
+        `Target channel changed to ${selectedChannel.name} (${selectedChannel.id}) by ${interaction.user.tag}.`
       );
       return;
     }
