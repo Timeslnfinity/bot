@@ -88,7 +88,7 @@ let activityStopTimer = null;
 let activityMoveTimer = null;
 let activityMoveInProgress = false;
 
-const ACTIVITY_MOVE_INTERVAL_MS = 2_000;
+const ACTIVITY_MOVE_INTERVAL_MS = 500;
 
 const client = new Client({
   intents: [
@@ -797,7 +797,7 @@ client.on('interactionCreate', async (interaction) => {
           `Activity started for **${durationSeconds} seconds**.\n` +
           `Opted-in participants: **${activityParticipantIds.size}**\n` +
           `Valid configured channels: **${channels.length}**.\n` +
-          `Participants in voice will move every **${ACTIVITY_MOVE_INTERVAL_MS / 1000} seconds**.`,
+          `Participants in voice will move every **${ACTIVITY_MOVE_INTERVAL_MS / 1000} second(s)**.`,
         ephemeral: true,
       });
       return;
