@@ -86,6 +86,7 @@ let activityStartedBy = null;
 let activityEndsAt = null;
 let activityStopTimer = null;
 let activityMoveTimer = null;
+let activityRunId = 0;
 
 const ACTIVITY_MOVE_INTERVAL_MS = 500;
 
@@ -347,8 +348,8 @@ async function getActivityChannels() {
   return channels;
 }
 
-async function moveActivityParticipant(channels, participantId) {
-  if (!activityRunning || channels.length < 2) {
+async function moveActivityParticipant(channels, participantId, runId) {
+  if (!activityRunning || runId !== activityRunId || channels.length < 2) {
     return;
   }
 
@@ -356,7 +357,7 @@ async function moveActivityParticipant(channels, participantId) {
     const guild = channels[0].guild;
     const member = await guild.members.fetch(participantId);
 
-    if (member.user.bot || !member.voice.channelId) return;
+    if (!activityRunning || runId !== activityRunId || member.user.bot) return;
 
     const destinationChannels = channels.filter(
       (channel) => channel.id !== member.voice.channelId
@@ -369,7 +370,12 @@ async function moveActivityParticipant(channels, participantId) {
         Math.floor(Math.random() * destinationChannels.length)
       ];
 
+    if (!activityRunning || runId !== activityRunId) return;
+
     await member.voice.setChannel(destination);
+
+    if (!activityRunning || runId !== activityRunId) return;
+
     console.log(
       `Moved ${member.user.tag} to activity channel ${destination.name}.`
     );
@@ -378,11 +384,11 @@ async function moveActivityParticipant(channels, participantId) {
   }
 }
 
-async function startActivityMovement(channels) {
+async function startActivityMovement(channels, runId) {
   let participantIndex = 0;
 
   const moveAndScheduleNext = () => {
-    if (!activityRunning) return;
+    if (!activityRunning || runId !== activityRunId) return;
 
     const participantIds = [...activityParticipantIds];
     if (participantIds.length > 0) {
@@ -390,7 +396,7 @@ async function startActivityMovement(channels) {
         participantIds[participantIndex % participantIds.length];
       participantIndex += 1;
 
-      moveActivityParticipant(channels, participantId).catch((error) => {
+      moveActivityParticipant(channels, participantId, runId).catch((error) => {
         console.error('Activity movement error:', error);
       });
     }
@@ -456,6 +462,7 @@ function leaveVoiceChannel() {
 
 function stopActivity(reason = 'Stopped.') {
   activityRunning = false;
+  activityRunId += 1;
   activityStartedBy = null;
   activityEndsAt = null;
 
@@ -824,6 +831,8 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       activityRunning = true;
+      activityRunId += 1;
+      const runId = activityRunId;
       activityStartedBy = interaction.user.id;
       activityEndsAt = Date.now() + durationSeconds * 1000;
 
@@ -831,7 +840,7 @@ client.on('interactionCreate', async (interaction) => {
         stopActivity('Duration completed.');
       }, durationSeconds * 1000);
 
-      startActivityMovement(channels).catch((error) => {
+      startActivityMovement(channels, runId).catch((error) => {
         console.error('Could not start activity movement:', error);
         stopActivity('Movement failed to start.');
       });
