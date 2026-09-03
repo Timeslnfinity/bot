@@ -262,6 +262,26 @@ function saveActivityConfig() {
   writeJson(ACTIVITY_CONFIG_FILE, activityConfig);
 }
 
+function logActivityMoveError(participantId, error) {
+  const isRateLimited = error?.status === 429 || error?.code === 429;
+
+  if (isRateLimited) {
+    const retryAfter = error.rawError?.retry_after ?? error.data?.retry_after;
+    const retryMessage = retryAfter == null
+      ? ''
+      : ` Retry after ${retryAfter} seconds.`;
+
+    console.warn(
+      `Discord rate limited the move for participant ${participantId}.${retryMessage}`
+    );
+    return;
+  }
+
+  console.warn(
+    `Could not move activity participant ${participantId}: ${error.message}`
+  );
+}
+
 function isVoiceChannel(channel) {
   return (
     channel &&
@@ -347,9 +367,7 @@ async function moveActivityParticipants(channels) {
             `Moved ${member.user.tag} to activity channel ${destination.name}.`
           );
         } catch (error) {
-          console.warn(
-            `Could not move activity participant ${participantId}: ${error.message}`
-          );
+          logActivityMoveError(participantId, error);
         }
       })
     );
@@ -359,15 +377,19 @@ async function moveActivityParticipants(channels) {
 }
 
 async function startActivityMovement(channels) {
-  await moveActivityParticipants(channels);
+  const moveAndScheduleNext = async () => {
+    await moveActivityParticipants(channels);
 
-  if (!activityRunning) return;
+    if (!activityRunning) return;
 
-  activityMoveTimer = setInterval(() => {
-    moveActivityParticipants(channels).catch((error) => {
-      console.error('Activity movement error:', error);
-    });
-  }, ACTIVITY_MOVE_INTERVAL_MS);
+    activityMoveTimer = setTimeout(() => {
+      moveAndScheduleNext().catch((error) => {
+        console.error('Activity movement error:', error);
+      });
+    }, ACTIVITY_MOVE_INTERVAL_MS);
+  };
+
+  await moveAndScheduleNext();
 }
 
 async function joinTargetVoiceChannel() {
@@ -432,7 +454,7 @@ function stopActivity(reason = 'Stopped.') {
   }
 
   if (activityMoveTimer) {
-    clearInterval(activityMoveTimer);
+    clearTimeout(activityMoveTimer);
     activityMoveTimer = null;
   }
 
