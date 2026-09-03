@@ -36,6 +36,28 @@ const commands = [
     .setDefaultMemberPermissions(adminOnly),
 
   new SlashCommandBuilder()
+    .setName('optin')
+    .setDescription('Add a user to the activity participant list.')
+    .addUserOption((option) =>
+      option
+        .setName('user')
+        .setDescription('User to add.')
+        .setRequired(true)
+    )
+    .setDefaultMemberPermissions(adminOnly),
+
+  new SlashCommandBuilder()
+    .setName('optout')
+    .setDescription('Remove a user from the activity participant list.')
+    .addUserOption((option) =>
+      option
+        .setName('user')
+        .setDescription('User to remove.')
+        .setRequired(true)
+    )
+    .setDefaultMemberPermissions(adminOnly),
+
+  new SlashCommandBuilder()
     .setName('shutdown')
     .setDescription('Leave voice and stop the bot process.')
     .setDefaultMemberPermissions(adminOnly),

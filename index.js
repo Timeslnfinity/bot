@@ -86,7 +86,6 @@ let activityStartedBy = null;
 let activityEndsAt = null;
 let activityStopTimer = null;
 let activityMoveTimer = null;
-let activityMoveInProgress = false;
 
 const ACTIVITY_MOVE_INTERVAL_MS = 500;
 
@@ -158,11 +157,25 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('optin')
-    .setDescription('Opt yourself in to the activity participant list.'),
+    .setDescription('Add a user to the activity participant list.')
+    .addUserOption((option) =>
+      option
+        .setName('user')
+        .setDescription('User to add.')
+        .setRequired(true)
+    )
+    .setDefaultMemberPermissions(adminOnly),
 
   new SlashCommandBuilder()
     .setName('optout')
-    .setDescription('Remove yourself from the activity participant list.'),
+    .setDescription('Remove a user from the activity participant list.')
+    .addUserOption((option) =>
+      option
+        .setName('user')
+        .setDescription('User to remove.')
+        .setRequired(true)
+    )
+    .setDefaultMemberPermissions(adminOnly),
 
   new SlashCommandBuilder()
     .setName('participants')
@@ -334,62 +347,60 @@ async function getActivityChannels() {
   return channels;
 }
 
-async function moveActivityParticipants(channels) {
-  if (!activityRunning || activityMoveInProgress || channels.length < 2) {
+async function moveActivityParticipant(channels, participantId) {
+  if (!activityRunning || channels.length < 2) {
     return;
   }
 
-  activityMoveInProgress = true;
-
   try {
     const guild = channels[0].guild;
+    const member = await guild.members.fetch(participantId);
 
-    await Promise.all(
-      [...activityParticipantIds].map(async (participantId) => {
-        try {
-          const member = await guild.members.fetch(participantId);
+    if (member.user.bot || !member.voice.channelId) return;
 
-          if (member.user.bot || !member.voice.channelId) return;
-
-          const destinationChannels = channels.filter(
-            (channel) => channel.id !== member.voice.channelId
-          );
-
-          if (destinationChannels.length === 0) return;
-
-          const destination =
-            destinationChannels[
-              Math.floor(Math.random() * destinationChannels.length)
-            ];
-
-          await member.voice.setChannel(destination);
-          console.log(
-            `Moved ${member.user.tag} to activity channel ${destination.name}.`
-          );
-        } catch (error) {
-          logActivityMoveError(participantId, error);
-        }
-      })
+    const destinationChannels = channels.filter(
+      (channel) => channel.id !== member.voice.channelId
     );
-  } finally {
-    activityMoveInProgress = false;
+
+    if (destinationChannels.length === 0) return;
+
+    const destination =
+      destinationChannels[
+        Math.floor(Math.random() * destinationChannels.length)
+      ];
+
+    await member.voice.setChannel(destination);
+    console.log(
+      `Moved ${member.user.tag} to activity channel ${destination.name}.`
+    );
+  } catch (error) {
+    logActivityMoveError(participantId, error);
   }
 }
 
 async function startActivityMovement(channels) {
-  const moveAndScheduleNext = async () => {
-    await moveActivityParticipants(channels);
+  let participantIndex = 0;
 
+  const moveAndScheduleNext = () => {
     if (!activityRunning) return;
 
-    activityMoveTimer = setTimeout(() => {
-      moveAndScheduleNext().catch((error) => {
+    const participantIds = [...activityParticipantIds];
+    if (participantIds.length > 0) {
+      const participantId =
+        participantIds[participantIndex % participantIds.length];
+      participantIndex += 1;
+
+      moveActivityParticipant(channels, participantId).catch((error) => {
         console.error('Activity movement error:', error);
       });
+    }
+
+    activityMoveTimer = setTimeout(() => {
+      moveAndScheduleNext();
     }, ACTIVITY_MOVE_INTERVAL_MS);
   };
 
-  await moveAndScheduleNext();
+  moveAndScheduleNext();
 }
 
 async function joinTargetVoiceChannel() {
@@ -458,8 +469,6 @@ function stopActivity(reason = 'Stopped.') {
     activityMoveTimer = null;
   }
 
-  activityMoveInProgress = false;
-
   console.log(`Activity stopped: ${reason}`);
 }
 
@@ -507,6 +516,8 @@ client.on('interactionCreate', async (interaction) => {
     'deny',
     'setchannel',
     'shutdown',
+    'optin',
+    'optout',
     'participants',
     'activity-channel-add',
     'activity-channel-remove',
@@ -659,18 +670,29 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (interaction.commandName === 'optin') {
-      activityParticipantIds.add(interaction.user.id);
+      const user = interaction.options.getUser('user', true);
+
+      if (user.bot) {
+        await interaction.reply({
+          content: 'You cannot add another bot as an activity participant.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      activityParticipantIds.add(user.id);
       saveParticipants();
 
       await interaction.reply({
-        content: 'You are now opted in to the activity participant list.',
+        content: `${user} is now opted in to the activity participant list.`,
         ephemeral: true,
       });
       return;
     }
 
     if (interaction.commandName === 'optout') {
-      const removed = activityParticipantIds.delete(interaction.user.id);
+      const user = interaction.options.getUser('user', true);
+      const removed = activityParticipantIds.delete(user.id);
 
       if (removed) {
         saveParticipants();
@@ -678,8 +700,8 @@ client.on('interactionCreate', async (interaction) => {
 
       await interaction.reply({
         content: removed
-          ? 'You are no longer opted in to the activity participant list.'
-          : 'You were not opted in.',
+          ? `${user} is no longer opted in to the activity participant list.`
+          : `${user} was not opted in.`,
         ephemeral: true,
       });
       return;
