@@ -87,6 +87,7 @@ let activityEndsAt = null;
 let activityStopTimer = null;
 let activityMoveTimer = null;
 let activityRunId = 0;
+const activityMovePromises = new Set();
 
 const ACTIVITY_MOVE_INTERVAL_MS = 500;
 
@@ -348,7 +349,12 @@ async function getActivityChannels() {
   return channels;
 }
 
-async function moveActivityParticipant(channels, participantId, runId) {
+async function moveActivityParticipant(
+  channels,
+  participantId,
+  destinationIndex,
+  runId
+) {
   if (!activityRunning || runId !== activityRunId || channels.length < 2) {
     return;
   }
@@ -357,18 +363,9 @@ async function moveActivityParticipant(channels, participantId, runId) {
     const guild = channels[0].guild;
     const member = await guild.members.fetch(participantId);
 
-    if (!activityRunning || runId !== activityRunId || member.user.bot) return;
+    if (!activityRunning || runId !== activityRunId) return;
 
-    const destinationChannels = channels.filter(
-      (channel) => channel.id !== member.voice.channelId
-    );
-
-    if (destinationChannels.length === 0) return;
-
-    const destination =
-      destinationChannels[
-        Math.floor(Math.random() * destinationChannels.length)
-      ];
+    const destination = channels[destinationIndex % channels.length];
 
     if (!activityRunning || runId !== activityRunId) return;
 
@@ -386,6 +383,7 @@ async function moveActivityParticipant(channels, participantId, runId) {
 
 async function startActivityMovement(channels, runId) {
   let participantIndex = 0;
+  let destinationIndex = 0;
 
   const moveAndScheduleNext = () => {
     if (!activityRunning || runId !== activityRunId) return;
@@ -395,10 +393,20 @@ async function startActivityMovement(channels, runId) {
       const participantId =
         participantIds[participantIndex % participantIds.length];
       participantIndex += 1;
+      const currentDestinationIndex = destinationIndex;
+      destinationIndex += 1;
 
-      moveActivityParticipant(channels, participantId, runId).catch((error) => {
+      const movePromise = moveActivityParticipant(
+        channels,
+        participantId,
+        currentDestinationIndex,
+        runId
+      ).catch((error) => {
         console.error('Activity movement error:', error);
       });
+
+      activityMovePromises.add(movePromise);
+      movePromise.finally(() => activityMovePromises.delete(movePromise));
     }
 
     activityMoveTimer = setTimeout(() => {
@@ -460,7 +468,7 @@ function leaveVoiceChannel() {
   return false;
 }
 
-function stopActivity(reason = 'Stopped.') {
+async function stopActivity(reason = 'Stopped.') {
   activityRunning = false;
   activityRunId += 1;
   activityStartedBy = null;
@@ -475,6 +483,8 @@ function stopActivity(reason = 'Stopped.') {
     clearTimeout(activityMoveTimer);
     activityMoveTimer = null;
   }
+
+  await Promise.allSettled([...activityMovePromises]);
 
   console.log(`Activity stopped: ${reason}`);
 }
@@ -837,12 +847,16 @@ client.on('interactionCreate', async (interaction) => {
       activityEndsAt = Date.now() + durationSeconds * 1000;
 
       activityStopTimer = setTimeout(() => {
-        stopActivity('Duration completed.');
+        stopActivity('Duration completed.').catch((error) => {
+          console.error('Could not finish stopping the activity:', error);
+        });
       }, durationSeconds * 1000);
 
       startActivityMovement(channels, runId).catch((error) => {
         console.error('Could not start activity movement:', error);
-        stopActivity('Movement failed to start.');
+        stopActivity('Movement failed to start.').catch((stopError) => {
+          console.error('Could not stop the activity:', stopError);
+        });
       });
 
       await interaction.reply({
@@ -865,7 +879,7 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
-      stopActivity(`Stopped by ${interaction.user.tag}.`);
+      await stopActivity(`Stopped by ${interaction.user.tag}.`);
 
       await interaction.reply({
         content: 'Activity stopped.',
