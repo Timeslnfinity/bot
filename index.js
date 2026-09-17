@@ -80,6 +80,7 @@ if (!Array.isArray(activityConfig.channelIds)) {
 
 let targetVoiceChannelId = DEFAULT_VOICE_CHANNEL_ID;
 let autoRejoinEnabled = true;
+let voiceErrorCooldownUntil = 0;
 
 let activityRunning = false;
 let activityStartedBy = null;
@@ -434,12 +435,30 @@ async function joinTargetVoiceChannel() {
   }
 
   const connection = joinVoiceChannel({
-    channelId: channel.id,
-    guildId: channel.guild.id,
-    adapterCreator: channel.guild.voiceAdapterCreator,
-    selfDeaf: true,
-    selfMute: false,
-  });
+  channelId: channel.id,
+  guildId: channel.guild.id,
+  adapterCreator: channel.guild.voiceAdapterCreator,
+  selfDeaf: true,
+  selfMute: false,
+});
+
+connection.on('error', (error) => {
+  console.error(
+    `[Voice connection error in guild ${channel.guild.id}] ${error.message}`
+  );
+
+  // Stop auto-rejoin for 10 minutes after a voice network failure.
+  voiceErrorCooldownUntil = Date.now() + 10 * 60 * 1000;
+
+  try {
+    connection.destroy();
+    console.log(
+      '[Voice] Connection destroyed after error. Auto-rejoin paused for 10 minutes.'
+    );
+  } catch (cleanupError) {
+    console.error('[Voice cleanup error]', cleanupError);
+  }
+});
 
   connection.on('stateChange', (oldState, newState) => {
     console.log(`Voice state: ${oldState.status} -> ${newState.status}`);
@@ -511,15 +530,30 @@ client.on('voiceStateUpdate', (oldState, newState) => {
   if (!autoRejoinEnabled) return;
   if (oldState.channelId === newState.channelId) return;
 
-  console.log('Bot was moved or disconnected. Rejoining in 5 seconds...');
+  const cooldownRemaining = voiceErrorCooldownUntil - Date.now();
 
-  setTimeout(() => {
-    if (!autoRejoinEnabled) return;
+if (cooldownRemaining > 0) {
+  console.warn(
+    `[Voice] Not rejoining yet because of a recent voice error. ` +
+    `Try /join again after ${Math.ceil(cooldownRemaining / 1000)} seconds.`
+  );
+  return;
+}
 
-    joinTargetVoiceChannel().catch((error) => {
-      console.error('Rejoin error:', error);
-    });
-  }, 5_000);
+console.log('Bot was moved or disconnected. Rejoining in 5 seconds...');
+
+setTimeout(() => {
+  if (!autoRejoinEnabled) return;
+
+  if (Date.now() < voiceErrorCooldownUntil) {
+    console.warn('[Voice] Rejoin skipped because voice-error cooldown is active.');
+    return;
+  }
+
+  joinTargetVoiceChannel().catch((error) => {
+    console.error('Rejoin error:', error);
+  });
+}, 5_000);
 });
 
 client.on('interactionCreate', async (interaction) => {
